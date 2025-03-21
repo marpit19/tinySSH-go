@@ -52,6 +52,13 @@ func (l *Logger) Debug(format string, args ...interface{}) {
 	}
 }
 
+// Info logs an informational message
+func (l *Logger) Info(format string, args ...interface{}) {
+	if l.level <= INFO {
+		l.logger.Println(l.formatMessage("INFO", format, args...))
+	}
+}
+
 // Warning logs a warning message
 func (l *Logger) Warning(format string, args ...interface{}) {
 	if l.level <= WARNING {
