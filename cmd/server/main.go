@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"net"
@@ -9,6 +10,9 @@ import (
 	"syscall"
 
 	"github.com/marpit19/tinySSH-go/pkg/common/logging"
+	"github.com/marpit19/tinySSH-go/pkg/protocol"
+	"github.com/marpit19/tinySSH-go/pkg/protocol/messages"
+	"github.com/marpit19/tinySSH-go/pkg/protocol/transport"
 )
 
 func main() {
@@ -78,22 +82,81 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 		logger.Info("Connection from %s closed", remoteAddr)
 	}()
 
-	// For now we will just be keeping the connetions open and log data received
-	buffer := make([]byte, 1024)
+	// Perform SSH version exchange
+	remoteVersion, err := transport.ExchangeVersions(conn, logger, true)
+	if err != nil {
+		logger.Error("Version exchange failed with %s: %v", remoteAddr, err)
+		return
+	}
+
+	logger.Info("Client %s version: %s", remoteAddr, remoteVersion)
+
+	// Create packet connection
+	packetConn := transport.NewPacketConn(conn, logger)
+
+	// Start keep-alive mechanism
+	packetConn.StartKeepAlive()
+
+	// Send Key Exchange Init
+	kexInitMsg := messages.NewKexInitMessage()
+	kexInitBytes, err := kexInitMsg.Marshal()
+	if err != nil {
+		logger.Error("failed to marshal KEXINIT: %v", err)
+		return
+	}
+
+	err = packetConn.WritePacket(&transport.Packet{
+		Type:    protocol.SSH_MSG_KEXINIT,
+		Payload: kexInitBytes[1:], // skip the message type byte which is included in Marshal()
+	})
+	if err != nil {
+		logger.Error("Failed to send KEXINIT: %v", err)
+		return
+	}
+
+	// Main packet processing loop
 	for {
-		n, err := conn.Read(buffer)
+		packet, err := packetConn.ReadPacket()
 		if err != nil {
 			if err.Error() == "EOF" {
 				logger.Info("Client %s disconnected", remoteAddr)
 			} else {
-				logger.Error("Error reading from connection %s: %v", remoteAddr, err)
+				logger.Error("Error reading packet from %s: %v", remoteAddr, err)
 			}
 			return
 		}
 
-		if n > 0 {
-			logger.Debug("Receved %d bytes from %s", n, remoteAddr)
-			// just logging not processing data
+		logger.Info("Received message type: %s", messages.MessageTypeString(packet.Type))
+
+		// Handle different message types
+		switch packet.Type {
+		case protocol.SSH_MSG_KEXINIT:
+			logger.Info("Received KEXINIT from client")
+		// right now we are just acknowledging recept but not fully processing it
+
+		case protocol.SSH_MSG_IGNORE:
+			// Ignore these messages (used for keep-alive)
+			logger.Debug("Received keep-alive from client")
+
+		case protocol.SSH_MSG_DISCONNECT:
+			logger.Info("Client requested disconnect")
+			return
+
+		default:
+			// Send SSH_MSG_UNIMPLEMENTED for unknown message types
+			var buf bytes.Buffer
+			messages.WriteUint32(&buf, packetConn.SequenceNumber-1)
+
+			unimplementedPacket := &transport.Packet{
+				Type:    protocol.SSH_MSG_UNIMPLEMENTED,
+				Payload: buf.Bytes(),
+			}
+
+			if err := packetConn.WritePacket(unimplementedPacket); err != nil {
+				logger.Error("Failed to send UNIMPLEMENTED: %v", err)
+				return
+			}
 		}
 	}
+
 }
