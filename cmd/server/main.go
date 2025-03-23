@@ -12,6 +12,8 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/marpit19/tinySSH-go/pkg/auth"
+	"github.com/marpit19/tinySSH-go/pkg/auth/store"
 	"github.com/marpit19/tinySSH-go/pkg/common/logging"
 	"github.com/marpit19/tinySSH-go/pkg/crypto"
 	"github.com/marpit19/tinySSH-go/pkg/protocol"
@@ -20,10 +22,12 @@ import (
 )
 
 var (
-	hostKey     *crypto.HostKey
-	connections = make(map[string]*transport.PacketConn)
-	connMutex   sync.Mutex
-	shutdown    = make(chan struct{})
+	hostKey             *crypto.HostKey
+	connections         = make(map[string]*transport.PacketConn)
+	connMutex           sync.Mutex
+	shutdown            = make(chan struct{})
+	authStore           auth.Authenticator
+	bruteForceProtector *auth.BruteForceProtector
 )
 
 func main() {
@@ -31,6 +35,7 @@ func main() {
 	port := flag.Int("port", 2222, "Port to listen on")
 	host := flag.String("host", "localhost", "Host to listen on")
 	keyPath := flag.String("key", "ssh_host_key", "Path to host key file")
+	authFilePath := flag.String("auth", "credentials.txt", "Path to credentials file")
 	flag.Parse()
 
 	addr := fmt.Sprintf("%s:%d", *host, *port)
@@ -47,6 +52,23 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("Host key loaded/generated syccessfully")
+
+	// Initialize authentication
+	bruteForceProtector = auth.NewBruteForceProtector(logger)
+
+	// Try to load credentials from file
+	authStore, err = store.NewFileAuthStore(*authFilePath, logger)
+	if err != nil {
+		logger.Warning("Failed to load authentication from file: %v", err)
+		logger.Info("Using in-memory authentication store with default credentials")
+
+		// Fall back to in-memory auth store with default credentials
+		memStore := store.NewMemoryAuthStore()
+		memStore.AddUser("admin", "password")
+		authStore = memStore
+
+		logger.Info("Added default user 'admin' with password 'password'")
+	}
 
 	// Create TCP listener
 	listener, err := net.Listen("tcp", addr)
@@ -167,11 +189,18 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 	remoteAddr := conn.RemoteAddr().String()
 	logger.Info("New connection from %s", remoteAddr)
 
-	// register handleConnection
+	// Check if IP is locked out due to too many failed authentication attempts
+	if bruteForceProtector.IsLockedOut(conn) {
+		logger.Warning("Connection from locked out IP %s rejected", remoteAddr)
+		conn.Close()
+		return
+	}
+
+	// Register connection
 	connMutex.Lock()
 	packetConn, err := transport.NewPacketConn(conn, logger, hostKey)
 	if err != nil {
-		logger.Error("failed to create packet connection: %v", err)
+		logger.Error("Failed to create packet connection: %v", err)
 		conn.Close()
 		connMutex.Unlock()
 		return
@@ -210,17 +239,21 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 	// Send our key exchange init message
 	err = packetConn.WritePacket(&transport.Packet{
 		Type:    protocol.SSH_MSG_KEXINIT,
-		Payload: serverKexInitBytes[1:], // skip the message type byte
+		Payload: serverKexInitBytes[1:], // Skip the message type byte
 	})
 	if err != nil {
 		logger.Error("Failed to send KEXINIT: %v", err)
 		return
 	}
 
-	// variables to track key exchange state
+	// Variables to track connection state
 	var clientKexInitBytes []byte
 	var keyExchangeComplete bool
+	var authenticated bool
+	var username string
+	var serviceRequested bool
 
+	// Main packet processing loop
 	for {
 		select {
 		case <-shutdown:
@@ -322,6 +355,178 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 			keyExchangeComplete = true
 			logger.Info("Key exchange completed successfully with %s", remoteAddr)
 
+		case protocol.SSH_MSG_SERVICE_REQUEST:
+			if !keyExchangeComplete {
+				logger.Error("Received SERVICE_REQUEST before key exchange completion")
+				return
+			}
+
+			// Parse service request
+			serviceRequest := &messages.ServiceRequestMessage{}
+			err := serviceRequest.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+			if err != nil {
+				logger.Error("Failed to unmarshal SERVICE_REQUEST: %v", err)
+				return
+			}
+
+			logger.Info("Client requested service: %s", serviceRequest.ServiceName)
+
+			// Currently we only support the ssh-userauth service
+			if serviceRequest.ServiceName != "ssh-userauth" {
+				logger.Error("Unsupported service requested: %s", serviceRequest.ServiceName)
+				return
+			}
+
+			// Send service accept
+			serviceAccept := messages.NewServiceAcceptMessage(serviceRequest.ServiceName)
+			serviceAcceptBytes, err := serviceAccept.Marshal()
+			if err != nil {
+				logger.Error("Failed to marshal SERVICE_ACCEPT: %v", err)
+				return
+			}
+
+			err = packetConn.WritePacket(&transport.Packet{
+				Type:    protocol.SSH_MSG_SERVICE_ACCEPT,
+				Payload: serviceAcceptBytes[1:], // Skip the message type byte
+			})
+			if err != nil {
+				logger.Error("Failed to send SERVICE_ACCEPT: %v", err)
+				return
+			}
+
+			serviceRequested = true
+
+		case protocol.SSH_MSG_USERAUTH_REQUEST:
+			if !keyExchangeComplete || !serviceRequested {
+				logger.Error("Received USERAUTH_REQUEST before key exchange or service request")
+				return
+			}
+
+			// Parse authentication request
+			authRequest := &messages.UserAuthRequestMessage{}
+			err := authRequest.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+			if err != nil {
+				logger.Error("Failed to unmarshal USERAUTH_REQUEST: %v", err)
+				return
+			}
+
+			logger.Info("Authentication request: username=%s, method=%s",
+				authRequest.Username, authRequest.MethodName)
+
+			// Get allowed authentication methods for this user
+			allowedMethods := authStore.GetAllowedMethods(authRequest.Username)
+
+			// Check if method is allowed
+			methodAllowed := false
+			for _, method := range allowedMethods {
+				if method == authRequest.MethodName {
+					methodAllowed = true
+					break
+				}
+			}
+
+			if !methodAllowed {
+				logger.Warning("Authentication method %s not allowed for user %s",
+					authRequest.MethodName, authRequest.Username)
+
+				// Send authentication failure
+				authFailure := messages.NewUserAuthFailureMessage(allowedMethods, false)
+				authFailureBytes, err := authFailure.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal USERAUTH_FAILURE: %v", err)
+					return
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_USERAUTH_FAILURE,
+					Payload: authFailureBytes[1:], // Skip the message type byte
+				})
+				if err != nil {
+					logger.Error("Failed to send USERAUTH_FAILURE: %v", err)
+					return
+				}
+
+				continue
+			}
+
+			// Handle different authentication methods
+			authSuccess := false
+
+			switch authRequest.MethodName {
+			case "none":
+				// The "none" method is always rejected
+				authSuccess = false
+
+			case "password":
+				// Parse password authentication data
+				passwordData, err := messages.UnmarshalPasswordRequestData(authRequest.MethodData)
+				if err != nil {
+					logger.Error("Failed to unmarshal password data: %v", err)
+					return
+				}
+
+				// Authenticate
+				authSuccess = authStore.AuthenticatePassword(authRequest.Username, passwordData.Password)
+
+				// Record the authentication attempt
+				if authSuccess {
+					bruteForceProtector.RecordSuccessfulAttempt(conn)
+					logger.Info("Password authentication successful for user %s", authRequest.Username)
+					username = authRequest.Username
+				} else {
+					if !bruteForceProtector.RecordFailedAttempt(conn) {
+						logger.Warning("Too many failed authentication attempts from %s", remoteAddr)
+						return
+					}
+					logger.Warning("Password authentication failed for user %s", authRequest.Username)
+				}
+
+			default:
+				logger.Warning("Unsupported authentication method: %s", authRequest.MethodName)
+				authSuccess = false
+			}
+
+			// Send authentication response
+			if authSuccess {
+				// Send authentication success
+				authSuccess := messages.NewUserAuthSuccessMessage()
+				authSuccessBytes, err := authSuccess.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal USERAUTH_SUCCESS: %v", err)
+					return
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_USERAUTH_SUCCESS,
+					Payload: authSuccessBytes[1:], // Skip the message type byte
+				})
+				if err != nil {
+					logger.Error("Failed to send USERAUTH_SUCCESS: %v", err)
+					return
+				}
+
+				authenticated = true
+				logger.Info("User %s authenticated successfully", username)
+
+			} else {
+				// Send authentication failure
+				authFailure := messages.NewUserAuthFailureMessage(allowedMethods, false)
+				authFailureBytes, err := authFailure.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal USERAUTH_FAILURE: %v", err)
+					return
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_USERAUTH_FAILURE,
+					Payload: authFailureBytes[1:], // Skip the message type byte
+				})
+				if err != nil {
+					logger.Error("Failed to send USERAUTH_FAILURE: %v", err)
+					return
+				}
+			}
+
 		case protocol.SSH_MSG_IGNORE:
 			// Ignore these messages (used for keep-alive)
 			logger.Debug("Received keep-alive from client")
@@ -333,6 +538,11 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 		default:
 			if !keyExchangeComplete {
 				logger.Error("Received unexpected message type %d during key exchange", packet.Type)
+				return
+			}
+
+			if !authenticated {
+				logger.Error("Received message type %d before authentication", packet.Type)
 				return
 			}
 

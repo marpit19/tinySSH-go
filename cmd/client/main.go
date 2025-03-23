@@ -21,6 +21,8 @@ func main() {
 	// Parse command line flags
 	port := flag.Int("port", 2222, "Port to connect to")
 	host := flag.String("host", "localhost", "Host to connect to")
+	username := flag.String("user", "admin", "Username for authentication")
+	password := flag.String("pass", "password", "Password for authentication")
 	flag.Parse()
 
 	addr := fmt.Sprintf("%s:%d", *host, *port)
@@ -89,6 +91,8 @@ func main() {
 	var serverKexInitBytes []byte
 	var keyExchangeInitiated bool
 	var keyExchangeComplete bool
+	var serviceAccepted bool
+	var authenticated bool
 
 	// Main client loop
 	for {
@@ -217,6 +221,103 @@ func main() {
 					logger.Debug("Key exchange flag is now true")
 				}
 				logger.Info("Key exchange completed successfully")
+
+				// Request userauth service
+				serviceRequest := messages.NewServiceRequestMessage("ssh-userauth")
+				serviceRequestBytes, err := serviceRequest.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal SERVICE_REQUEST: %v", err)
+					os.Exit(1)
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_SERVICE_REQUEST,
+					Payload: serviceRequestBytes[1:], // Skip message type
+				})
+				if err != nil {
+					logger.Error("Failed to send SERVICE_REQUEST: %v", err)
+					os.Exit(1)
+				}
+
+				logger.Info("Requested ssh-userauth service")
+
+			case protocol.SSH_MSG_SERVICE_ACCEPT:
+				logger.Info("Received SERVICE_ACCEPT from server")
+
+				// Parse service accept
+				serviceAccept := &messages.ServiceAcceptMessage{}
+				err := serviceAccept.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal SERVICE_ACCEPT: %v", err)
+					os.Exit(1)
+				}
+
+				if serviceAccept.ServiceName != "ssh-userauth" {
+					logger.Error("Unexpected service accepted: %s", serviceAccept.ServiceName)
+					os.Exit(1)
+				}
+
+				serviceAccepted = true
+				if serviceAccepted {
+					logger.Debug("service is accepted")
+				}
+
+				// Send password authentication request
+				passwordData := messages.MarshalPasswordRequestData(*password)
+
+				authRequest := messages.NewUserAuthRequestMessage(
+					*username,
+					"ssh-connection",
+					"password",
+					passwordData,
+				)
+
+				authRequestBytes, err := authRequest.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal USERAUTH_REQUEST: %v", err)
+					os.Exit(1)
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_USERAUTH_REQUEST,
+					Payload: authRequestBytes[1:], // Skip message type
+				})
+				if err != nil {
+					logger.Error("Failed to send USERAUTH_REQUEST: %v", err)
+					os.Exit(1)
+				}
+
+				logger.Info("Sent password authentication request for user %s", *username)
+
+			case protocol.SSH_MSG_USERAUTH_SUCCESS:
+				logger.Info("Received USERAUTH_SUCCESS from server")
+				authenticated = true
+				if authenticated {
+					logger.Debug("authentication is true")
+				}
+				logger.Info("Authentication successful!")
+
+				// In a real client, we would now move to the connection protocol
+				// and establish channels, but that's for the next phase
+
+			case protocol.SSH_MSG_USERAUTH_FAILURE:
+				logger.Info("Received USERAUTH_FAILURE from server")
+
+				// Parse authentication failure
+				authFailure := &messages.UserAuthFailureMessage{}
+				err := authFailure.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal USERAUTH_FAILURE: %v", err)
+					os.Exit(1)
+				}
+
+				logger.Warning("Authentication failed. Allowed methods: %v",
+					authFailure.AuthMethodsRemaining)
+				logger.Warning("Please check your username and password and try again")
+
+				// In a real client, we would try another authentication method,
+				// but for this simple implementation, we just exit
+				os.Exit(1)
 
 			case protocol.SSH_MSG_IGNORE:
 				// Ignore these messages (used for keep-alive)
