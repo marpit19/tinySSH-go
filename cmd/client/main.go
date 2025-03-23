@@ -10,11 +10,16 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/marpit19/tinySSH-go/pkg/channel"
 	"github.com/marpit19/tinySSH-go/pkg/common/logging"
 	"github.com/marpit19/tinySSH-go/pkg/crypto"
 	"github.com/marpit19/tinySSH-go/pkg/protocol"
 	"github.com/marpit19/tinySSH-go/pkg/protocol/messages"
 	"github.com/marpit19/tinySSH-go/pkg/protocol/transport"
+)
+
+var (
+	activeChannel *channel.Channel
 )
 
 func main() {
@@ -50,7 +55,7 @@ func main() {
 
 	logger.Info("Server version: %s", remoteVersion)
 
-	// Create packet connection
+	// Create packet connection (without host key since client doesn't need one)
 	packetConn, err := transport.NewPacketConn(conn, logger, nil)
 	if err != nil {
 		logger.Error("Failed to create packet connection: %v", err)
@@ -87,7 +92,7 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Variables to track key exchange state
+	// Variables to track connection state
 	var serverKexInitBytes []byte
 	var keyExchangeInitiated bool
 	var keyExchangeComplete bool
@@ -259,7 +264,7 @@ func main() {
 
 				serviceAccepted = true
 				if serviceAccepted {
-					logger.Debug("service is accepted")
+					logger.Debug("serviceAccepted variable is now true")
 				}
 
 				// Send password authentication request
@@ -293,12 +298,39 @@ func main() {
 				logger.Info("Received USERAUTH_SUCCESS from server")
 				authenticated = true
 				if authenticated {
-					logger.Debug("authentication is true")
+					logger.Debug("authenticated is now true")
 				}
 				logger.Info("Authentication successful!")
 
-				// In a real client, we would now move to the connection protocol
-				// and establish channels, but that's for the next phase
+				// Open a session channel
+				channelType := string(channel.SessionChannel)
+				senderChannel := uint32(0) // We'll increment this for each channel
+
+				// Create channel open message
+				channelOpen := messages.NewChannelOpenMessage(
+					channelType,
+					senderChannel,
+					channel.DefaultWindowSize,
+					channel.DefaultMaxPacketSize,
+					nil,
+				)
+
+				channelOpenBytes, err := channelOpen.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal CHANNEL_OPEN: %v", err)
+					os.Exit(1)
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_CHANNEL_OPEN,
+					Payload: channelOpenBytes[1:],
+				})
+				if err != nil {
+					logger.Error("Failed to send CHANNEL_OPEN: %v", err)
+					os.Exit(1)
+				}
+
+				logger.Info("Requested channel open: type=%s, id=%d", channelType, senderChannel)
 
 			case protocol.SSH_MSG_USERAUTH_FAILURE:
 				logger.Info("Received USERAUTH_FAILURE from server")
@@ -319,6 +351,183 @@ func main() {
 				// but for this simple implementation, we just exit
 				os.Exit(1)
 
+			case protocol.SSH_MSG_CHANNEL_OPEN_CONFIRM:
+				logger.Info("Received CHANNEL_OPEN_CONFIRM from server")
+
+				// Parse channel open confirm
+				channelConfirm := &messages.ChannelOpenConfirmMessage{}
+				err := channelConfirm.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal CHANNEL_OPEN_CONFIRM: %v", err)
+					os.Exit(1)
+				}
+
+				logger.Info("Channel %d confirmed, remote id=%d",
+					channelConfirm.RecipientChannel, channelConfirm.SenderChannel)
+
+				// Create channel object
+				activeChannel = channel.NewChannel(channel.ChannelConfig{
+					ChannelType:   channel.SessionChannel,
+					LocalID:       channelConfirm.RecipientChannel,
+					RemoteID:      channelConfirm.SenderChannel,
+					InitialWindow: channelConfirm.InitialWindow,
+					MaxPacketSize: channelConfirm.MaxPacketSize,
+					Logger:        logger,
+				})
+
+				activeChannel.SetStatus(channel.ChannelStatusOpen)
+
+				// Send some test data
+				testData := []byte("Hello from TinySSH-Go client!\n")
+
+				dataMsg := messages.NewChannelDataMessage(
+					activeChannel.RemoteID(),
+					testData,
+				)
+
+				dataBytes, err := dataMsg.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal CHANNEL_DATA: %v", err)
+					os.Exit(1)
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_CHANNEL_DATA,
+					Payload: dataBytes[1:],
+				})
+				if err != nil {
+					logger.Error("Failed to send CHANNEL_DATA: %v", err)
+					os.Exit(1)
+				}
+
+				// Update window
+				activeChannel.AdjustRemoteWindow(^uint32(len(testData) - 1))
+
+			case protocol.SSH_MSG_CHANNEL_OPEN_FAILURE:
+				logger.Info("Received CHANNEL_OPEN_FAILURE from server")
+
+				// Parse channel open failure
+				channelFailure := &messages.ChannelOpenFailureMessage{}
+				err := channelFailure.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal CHANNEL_OPEN_FAILURE: %v", err)
+					os.Exit(1)
+				}
+
+				logger.Error("Channel %d open failed: code=%d, reason=%s",
+					channelFailure.RecipientChannel, channelFailure.ReasonCode,
+					channelFailure.Description)
+
+				os.Exit(1)
+
+			case protocol.SSH_MSG_CHANNEL_WINDOW_ADJUST:
+				// Parse window adjust message
+				windowAdjust := &messages.ChannelWindowAdjustMessage{}
+				err := windowAdjust.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal CHANNEL_WINDOW_ADJUST: %v", err)
+					continue
+				}
+
+				if activeChannel != nil && windowAdjust.RecipientChannel == activeChannel.LocalID() {
+					activeChannel.AdjustRemoteWindow(windowAdjust.BytesToAdd)
+					logger.Debug("Adjusted window for channel %d by %d bytes",
+						windowAdjust.RecipientChannel, windowAdjust.BytesToAdd)
+				}
+
+			case protocol.SSH_MSG_CHANNEL_DATA:
+				// Parse channel data message
+				channelData := &messages.ChannelDataMessage{}
+				err := channelData.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal CHANNEL_DATA: %v", err)
+					continue
+				}
+
+				if activeChannel != nil && channelData.RecipientChannel == activeChannel.LocalID() {
+					logger.Info("Received data on channel %d: %s",
+						channelData.RecipientChannel, string(channelData.Data))
+
+					// Consume window space
+					if err := activeChannel.HandleData(channelData.Data); err != nil {
+						logger.Error("Error handling channel data: %v", err)
+					}
+
+					// Check if we need to adjust our window
+					if activeChannel.NeedsWindowAdjustment() {
+						adjustment := activeChannel.WindowAdjustmentSize()
+						activeChannel.AdjustLocalWindow(adjustment)
+
+						// Send window adjustment
+						adjustMsg := messages.NewChannelWindowAdjustMessage(
+							activeChannel.RemoteID(),
+							adjustment,
+						)
+
+						adjustBytes, err := adjustMsg.Marshal()
+						if err != nil {
+							logger.Error("Failed to marshal CHANNEL_WINDOW_ADJUST: %v", err)
+						} else {
+							err = packetConn.WritePacket(&transport.Packet{
+								Type:    protocol.SSH_MSG_CHANNEL_WINDOW_ADJUST,
+								Payload: adjustBytes[1:],
+							})
+							if err != nil {
+								logger.Error("Failed to send CHANNEL_WINDOW_ADJUST: %v", err)
+							} else {
+								logger.Debug("Adjusted window for channel %d by %d bytes",
+									activeChannel.RemoteID(), adjustment)
+							}
+						}
+					}
+				}
+
+			case protocol.SSH_MSG_CHANNEL_EOF:
+				// Parse channel EOF message
+				channelEOF := &messages.ChannelEOFMessage{}
+				err := channelEOF.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal CHANNEL_EOF: %v", err)
+					continue
+				}
+
+				if activeChannel != nil && channelEOF.RecipientChannel == activeChannel.LocalID() {
+					logger.Info("Received EOF for channel %d", channelEOF.RecipientChannel)
+				}
+
+			case protocol.SSH_MSG_CHANNEL_CLOSE:
+				// Parse channel close message
+				channelClose := &messages.ChannelCloseMessage{}
+				err := channelClose.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal CHANNEL_CLOSE: %v", err)
+					continue
+				}
+
+				if activeChannel != nil && channelClose.RecipientChannel == activeChannel.LocalID() {
+					logger.Info("Channel %d closed by server", channelClose.RecipientChannel)
+
+					// Close our end too
+					activeChannel.Close()
+
+					// Send our own close message
+					closeMsg := messages.NewChannelCloseMessage(activeChannel.RemoteID())
+					closeBytes, err := closeMsg.Marshal()
+					if err != nil {
+						logger.Error("Failed to marshal CHANNEL_CLOSE: %v", err)
+					} else {
+						err = packetConn.WritePacket(&transport.Packet{
+							Type:    protocol.SSH_MSG_CHANNEL_CLOSE,
+							Payload: closeBytes[1:],
+						})
+						if err != nil {
+							logger.Error("Failed to send CHANNEL_CLOSE: %v", err)
+						}
+					}
+
+					activeChannel = nil
+				}
+
 			case protocol.SSH_MSG_IGNORE:
 				// Ignore these messages (used for keep-alive)
 				logger.Debug("Received keep-alive from server")
@@ -334,6 +543,26 @@ func main() {
 
 		case sig := <-sigChan:
 			logger.Info("Received signal: %v, disconnecting", sig)
+
+			// Close channel if active
+			if activeChannel != nil {
+				// Send channel close message
+				closeMsg := messages.NewChannelCloseMessage(activeChannel.RemoteID())
+				closeBytes, err := closeMsg.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal CHANNEL_CLOSE: %v", err)
+				} else {
+					err = packetConn.WritePacket(&transport.Packet{
+						Type:    protocol.SSH_MSG_CHANNEL_CLOSE,
+						Payload: closeBytes[1:],
+					})
+					if err != nil {
+						logger.Error("Failed to send CHANNEL_CLOSE: %v", err)
+					}
+				}
+
+				activeChannel.Close()
+			}
 
 			// Send disconnect message
 			var buf bytes.Buffer

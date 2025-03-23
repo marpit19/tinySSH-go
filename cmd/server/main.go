@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -14,11 +15,13 @@ import (
 
 	"github.com/marpit19/tinySSH-go/pkg/auth"
 	"github.com/marpit19/tinySSH-go/pkg/auth/store"
+	"github.com/marpit19/tinySSH-go/pkg/channel"
 	"github.com/marpit19/tinySSH-go/pkg/common/logging"
 	"github.com/marpit19/tinySSH-go/pkg/crypto"
 	"github.com/marpit19/tinySSH-go/pkg/protocol"
 	"github.com/marpit19/tinySSH-go/pkg/protocol/messages"
 	"github.com/marpit19/tinySSH-go/pkg/protocol/transport"
+	"github.com/marpit19/tinySSH-go/pkg/session"
 )
 
 var (
@@ -28,10 +31,13 @@ var (
 	shutdown            = make(chan struct{})
 	authStore           auth.Authenticator
 	bruteForceProtector *auth.BruteForceProtector
+	sessions            = make(map[string]*session.Session) // Maps remoteAddr to session
+	sessionMutex        sync.Mutex
+	logger              *logging.Logger
 )
 
 func main() {
-	// Parse cli flags
+	// Parse command line flags
 	port := flag.Int("port", 2222, "Port to listen on")
 	host := flag.String("host", "localhost", "Host to listen on")
 	keyPath := flag.String("key", "ssh_host_key", "Path to host key file")
@@ -40,8 +46,8 @@ func main() {
 
 	addr := fmt.Sprintf("%s:%d", *host, *port)
 
-	// Initalize logger
-	logger := logging.NewLogger("server")
+	// Initialize logger
+	logger = logging.NewLogger("server")
 	logger.Info("Starting TinySSH-Go server on %s", addr)
 
 	// Load or generate host key
@@ -51,7 +57,7 @@ func main() {
 		logger.Error("Failed to load or generate host key: %v", err)
 		os.Exit(1)
 	}
-	logger.Info("Host key loaded/generated syccessfully")
+	logger.Info("Host key loaded/generated successfully")
 
 	// Initialize authentication
 	bruteForceProtector = auth.NewBruteForceProtector(logger)
@@ -97,6 +103,7 @@ func main() {
 				case <-shutdown:
 					return
 				default:
+					// Check if the listener was closed
 					if opErr, ok := err.(*net.OpError); ok {
 						if opErr.Err.Error() == "use of closed network connection" {
 							return
@@ -110,7 +117,7 @@ func main() {
 		}
 	}()
 
-	// start a goroutine to handle console commands
+	// Start a goroutine to handle console commands
 	go handleConsoleCommands(logger, listener)
 
 	// Main server loop
@@ -131,10 +138,10 @@ func main() {
 	}
 }
 
-// handle console commands
+// handleConsoleCommands processes commands from the terminal
 func handleConsoleCommands(logger *logging.Logger, listener net.Listener) {
 	scanner := bufio.NewScanner(os.Stdin)
-	logger.Info("Server commands interface ready. Type 'exit()' to shutdown.")
+	logger.Info("Server command interface ready. Type 'exit()' to shutdown.")
 
 	for scanner.Scan() {
 		command := strings.TrimSpace(scanner.Text())
@@ -164,7 +171,7 @@ func handleConsoleCommands(logger *logging.Logger, listener net.Listener) {
 	}
 }
 
-// shutdownServer will do graceful shutdown
+// shutdownServer gracefully shuts down the server
 func shutdownServer(logger *logging.Logger, listener net.Listener) {
 	logger.Info("Closing all connections...")
 
@@ -177,6 +184,15 @@ func shutdownServer(logger *logging.Logger, listener net.Listener) {
 	}
 	connMutex.Unlock()
 
+	// Close all sessions
+	sessionMutex.Lock()
+	for addr, sess := range sessions {
+		logger.Info("Closing session for %s", addr)
+		sess.Close()
+		delete(sessions, addr)
+	}
+	sessionMutex.Unlock()
+
 	// Close listener
 	logger.Info("Closing listener...")
 	listener.Close()
@@ -184,7 +200,7 @@ func shutdownServer(logger *logging.Logger, listener net.Listener) {
 	logger.Info("Server shutdown complete")
 }
 
-// handleConnection processes a new client connection
+// handleConnection processes a client connection
 func handleConnection(conn net.Conn, logger *logging.Logger) {
 	remoteAddr := conn.RemoteAddr().String()
 	logger.Info("New connection from %s", remoteAddr)
@@ -215,6 +231,14 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 		connMutex.Lock()
 		delete(connections, remoteAddr)
 		connMutex.Unlock()
+
+		// Unregister session if exists
+		sessionMutex.Lock()
+		if userSession, ok := sessions[remoteAddr]; ok {
+			userSession.Close()
+			delete(sessions, remoteAddr)
+		}
+		sessionMutex.Unlock()
 
 		logger.Info("Connection from %s closed", remoteAddr)
 	}()
@@ -488,6 +512,15 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 
 			// Send authentication response
 			if authSuccess {
+				// Create new session for this connection
+				sessionMutex.Lock()
+				userSession := session.NewSession(authRequest.Username, logger)
+				sessions[remoteAddr] = userSession
+				sessionMutex.Unlock()
+
+				// Register handlers for channel types
+				userSession.RegisterChannelHandler(channel.SessionChannel, handleSessionChannel)
+
 				// Send authentication success
 				authSuccess := messages.NewUserAuthSuccessMessage()
 				authSuccessBytes, err := authSuccess.Marshal()
@@ -527,6 +560,274 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 				}
 			}
 
+		case protocol.SSH_MSG_CHANNEL_OPEN:
+			if !authenticated {
+				logger.Error("Received CHANNEL_OPEN before authentication")
+				return
+			}
+
+			// Parse channel open message
+			channelOpen := &messages.ChannelOpenMessage{}
+			err := channelOpen.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+			if err != nil {
+				logger.Error("Failed to unmarshal CHANNEL_OPEN: %v", err)
+				return
+			}
+
+			logger.Info("Received channel open request: type=%s, sender=%d, window=%d, max=%d",
+				channelOpen.ChannelType, channelOpen.SenderChannel,
+				channelOpen.InitialWindow, channelOpen.MaxPacketSize)
+
+			// Get user's session
+			sessionMutex.Lock()
+			userSession, ok := sessions[remoteAddr]
+			sessionMutex.Unlock()
+
+			if !ok {
+				logger.Error("No session found for %s", remoteAddr)
+				return
+			}
+
+			// Handle channel open
+			recipientChannel, err := userSession.HandleChannelOpen(
+				channel.ChannelType(channelOpen.ChannelType),
+				channelOpen.SenderChannel,
+				channelOpen.InitialWindow,
+				channelOpen.MaxPacketSize,
+			)
+
+			if err != nil {
+				logger.Error("Failed to open channel: %v", err)
+
+				// Send channel open failure
+				failureMsg := messages.NewChannelOpenFailureMessage(
+					channelOpen.SenderChannel,
+					uint32(channel.ChannelOpenUnknownChannelType),
+					err.Error(),
+					"",
+				)
+
+				failureBytes, err := failureMsg.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal CHANNEL_OPEN_FAILURE: %v", err)
+					return
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_CHANNEL_OPEN_FAILURE,
+					Payload: failureBytes[1:],
+				})
+				if err != nil {
+					logger.Error("Failed to send CHANNEL_OPEN_FAILURE: %v", err)
+					return
+				}
+			} else {
+				// Send channel open confirmation
+				confirmMsg := messages.NewChannelOpenConfirmMessage(
+					channelOpen.SenderChannel,
+					recipientChannel,
+					channel.DefaultWindowSize,
+					channel.DefaultMaxPacketSize,
+					nil,
+				)
+
+				confirmBytes, err := confirmMsg.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal CHANNEL_OPEN_CONFIRM: %v", err)
+					return
+				}
+
+				err = packetConn.WritePacket(&transport.Packet{
+					Type:    protocol.SSH_MSG_CHANNEL_OPEN_CONFIRM,
+					Payload: confirmBytes[1:],
+				})
+				if err != nil {
+					logger.Error("Failed to send CHANNEL_OPEN_CONFIRM: %v", err)
+					return
+				}
+
+				logger.Info("Channel %d opened successfully", recipientChannel)
+			}
+
+		case protocol.SSH_MSG_CHANNEL_WINDOW_ADJUST:
+			if !authenticated {
+				logger.Error("Received CHANNEL_WINDOW_ADJUST before authentication")
+				return
+			}
+
+			// Parse window adjust message
+			windowAdjust := &messages.ChannelWindowAdjustMessage{}
+			err := windowAdjust.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+			if err != nil {
+				logger.Error("Failed to unmarshal CHANNEL_WINDOW_ADJUST: %v", err)
+				return
+			}
+
+			// Get user's session
+			sessionMutex.Lock()
+			userSession, ok := sessions[remoteAddr]
+			sessionMutex.Unlock()
+
+			if !ok {
+				logger.Error("No session found for %s", remoteAddr)
+				return
+			}
+
+			// Handle window adjust
+			err = userSession.HandleChannelWindowAdjust(windowAdjust.RecipientChannel, windowAdjust.BytesToAdd)
+			if err != nil {
+				logger.Error("Failed to adjust window: %v", err)
+			} else {
+				logger.Debug("Adjusted window for channel %d by %d bytes",
+					windowAdjust.RecipientChannel, windowAdjust.BytesToAdd)
+			}
+
+		case protocol.SSH_MSG_CHANNEL_DATA:
+			if !authenticated {
+				logger.Error("Received CHANNEL_DATA before authentication")
+				return
+			}
+
+			// Parse channel data message
+			channelData := &messages.ChannelDataMessage{}
+			err := channelData.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+			if err != nil {
+				logger.Error("Failed to unmarshal CHANNEL_DATA: %v", err)
+				return
+			}
+
+			// Get user's session
+			sessionMutex.Lock()
+			userSession, ok := sessions[remoteAddr]
+			sessionMutex.Unlock()
+
+			if !ok {
+				logger.Error("No session found for %s", remoteAddr)
+				return
+			}
+
+			// Handle channel data
+			err = userSession.HandleChannelData(channelData.RecipientChannel, channelData.Data)
+			if err != nil {
+				logger.Error("Failed to handle channel data: %v", err)
+			} else {
+				logger.Debug("Received %d bytes for channel %d",
+					len(channelData.Data), channelData.RecipientChannel)
+
+				// Check if we need to adjust our window
+				ch, err := userSession.GetChannel(channelData.RecipientChannel)
+				if err == nil && ch.NeedsWindowAdjustment() {
+					adjustment := ch.WindowAdjustmentSize()
+					ch.AdjustLocalWindow(adjustment)
+
+					// Send window adjustment
+					adjustMsg := messages.NewChannelWindowAdjustMessage(
+						ch.RemoteID(),
+						adjustment,
+					)
+
+					adjustBytes, err := adjustMsg.Marshal()
+					if err != nil {
+						logger.Error("Failed to marshal CHANNEL_WINDOW_ADJUST: %v", err)
+					} else {
+						err = packetConn.WritePacket(&transport.Packet{
+							Type:    protocol.SSH_MSG_CHANNEL_WINDOW_ADJUST,
+							Payload: adjustBytes[1:],
+						})
+						if err != nil {
+							logger.Error("Failed to send CHANNEL_WINDOW_ADJUST: %v", err)
+						} else {
+							logger.Debug("Adjusted window for channel %d by %d bytes",
+								ch.RemoteID(), adjustment)
+						}
+					}
+				}
+			}
+
+		case protocol.SSH_MSG_CHANNEL_EOF:
+			if !authenticated {
+				logger.Error("Received CHANNEL_EOF before authentication")
+				return
+			}
+
+			// Parse channel EOF message
+			channelEOF := &messages.ChannelEOFMessage{}
+			err := channelEOF.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+			if err != nil {
+				logger.Error("Failed to unmarshal CHANNEL_EOF: %v", err)
+				return
+			}
+
+			// Get user's session
+			sessionMutex.Lock()
+			userSession, ok := sessions[remoteAddr]
+			sessionMutex.Unlock()
+
+			if !ok {
+				logger.Error("No session found for %s", remoteAddr)
+				return
+			}
+
+			// Get the channel
+			ch, err := userSession.GetChannel(channelEOF.RecipientChannel)
+			if err != nil {
+				logger.Error("Failed to get channel: %v", err)
+				return
+			}
+			if ch == nil {
+				logger.Debug("ch is nil right now...")
+			}
+
+			// Just log EOF for now
+			logger.Info("Received EOF for channel %d", channelEOF.RecipientChannel)
+
+		case protocol.SSH_MSG_CHANNEL_CLOSE:
+			if !authenticated {
+				logger.Error("Received CHANNEL_CLOSE before authentication")
+				return
+			}
+
+			// Parse channel close message
+			channelClose := &messages.ChannelCloseMessage{}
+			err := channelClose.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+			if err != nil {
+				logger.Error("Failed to unmarshal CHANNEL_CLOSE: %v", err)
+				return
+			}
+
+			// Get user's session
+			sessionMutex.Lock()
+			userSession, ok := sessions[remoteAddr]
+			sessionMutex.Unlock()
+
+			if !ok {
+				logger.Error("No session found for %s", remoteAddr)
+				return
+			}
+
+			// Handle channel close
+			err = userSession.HandleChannelClose(channelClose.RecipientChannel)
+			if err != nil {
+				logger.Error("Failed to close channel: %v", err)
+			} else {
+				logger.Info("Channel %d closed", channelClose.RecipientChannel)
+
+				// Send our own close message
+				closeMsg := messages.NewChannelCloseMessage(channelClose.RecipientChannel)
+				closeBytes, err := closeMsg.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal CHANNEL_CLOSE: %v", err)
+				} else {
+					err = packetConn.WritePacket(&transport.Packet{
+						Type:    protocol.SSH_MSG_CHANNEL_CLOSE,
+						Payload: closeBytes[1:],
+					})
+					if err != nil {
+						logger.Error("Failed to send CHANNEL_CLOSE: %v", err)
+					}
+				}
+			}
+
 		case protocol.SSH_MSG_IGNORE:
 			// Ignore these messages (used for keep-alive)
 			logger.Debug("Received keep-alive from client")
@@ -561,4 +862,38 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 			}
 		}
 	}
+}
+
+// handleSessionChannel handles a "session" type channel
+func handleSessionChannel(ch *channel.Channel) error {
+	logger.Info("New session channel %d", ch.LocalID())
+
+	// Set channel as open
+	ch.SetStatus(channel.ChannelStatusOpen)
+
+	// Process data from this channel
+	for {
+		// Read data in a blocking mode
+		buffer := make([]byte, 1024)
+		n, err := ch.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				logger.Info("Channel %d EOF", ch.LocalID())
+				break
+			}
+			return fmt.Errorf("error reading from channel: %v", err)
+		}
+
+		if n > 0 {
+			logger.Debug("Read %d bytes from channel %d", n, ch.LocalID())
+
+			// Echo back for now (we'll replace this with proper command execution in Phase 6)
+			_, err = ch.Write(buffer[:n])
+			if err != nil {
+				return fmt.Errorf("error writing to channel: %v", err)
+			}
+		}
+	}
+
+	return nil
 }
