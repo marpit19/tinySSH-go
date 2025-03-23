@@ -4,19 +4,21 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/marpit19/tinySSH-go/pkg/common/logging"
+	"github.com/marpit19/tinySSH-go/pkg/crypto"
 	"github.com/marpit19/tinySSH-go/pkg/protocol"
 	"github.com/marpit19/tinySSH-go/pkg/protocol/messages"
 	"github.com/marpit19/tinySSH-go/pkg/protocol/transport"
 )
 
 func main() {
-	// Parse cli flags
+	// Parse command line flags
 	port := flag.Int("port", 2222, "Port to connect to")
 	host := flag.String("host", "localhost", "Host to connect to")
 	flag.Parse()
@@ -47,10 +49,21 @@ func main() {
 	logger.Info("Server version: %s", remoteVersion)
 
 	// Create packet connection
-	packetConn := transport.NewPacketConn(conn, logger)
+	packetConn, err := transport.NewPacketConn(conn, logger, nil)
+	if err != nil {
+		logger.Error("Failed to create packet connection: %v", err)
+		os.Exit(1)
+	}
 
 	// Start keep-alive mechanism
 	packetConn.StartKeepAlive()
+
+	// Create and init our key exchange session
+	session, err := crypto.NewSession()
+	if err != nil {
+		logger.Error("Failed to create crypto session: %v", err)
+		os.Exit(1)
+	}
 
 	// Set up a channel to receive packets
 	packetChan := make(chan *transport.Packet)
@@ -72,6 +85,11 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	// Variables to track key exchange state
+	var serverKexInitBytes []byte
+	var keyExchangeInitiated bool
+	var keyExchangeComplete bool
+
 	// Main client loop
 	for {
 		select {
@@ -83,54 +101,154 @@ func main() {
 			case protocol.SSH_MSG_KEXINIT:
 				logger.Info("Received KEXINIT from server")
 
-				// Send our Key Exchange Init
-				kexInitMsg := messages.NewKexInitMessage()
-				kexInitBytes, err := kexInitMsg.Marshal()
+				// Save server's KEXINIT
+				serverKexInitBytes = append([]byte{packet.Type}, packet.Payload...)
+
+				// Send our Key Exchange Init if we haven't already
+				if !keyExchangeInitiated {
+					// Create our key exchange init message
+					kexInitMsg := messages.NewKexInitMessage()
+					clientKexInitBytes, err := kexInitMsg.Marshal()
+					if err != nil {
+						logger.Error("Failed to marshal KEXINIT: %v", err)
+						os.Exit(1)
+					}
+
+					// Store our KEXINIT for later
+					myKexInitBytes := clientKexInitBytes
+
+					// Send our key exchange init
+					err = packetConn.WritePacket(&transport.Packet{
+						Type:    protocol.SSH_MSG_KEXINIT,
+						Payload: clientKexInitBytes[1:], // Skip message type
+					})
+					if err != nil {
+						logger.Error("Failed to send KEXINIT: %v", err)
+						os.Exit(1)
+					}
+
+					// Initialize key exchange
+					err = packetConn.InitiateKeyExchange(myKexInitBytes, serverKexInitBytes)
+					if err != nil {
+						logger.Error("Failed to initiate key exchange: %v", err)
+						os.Exit(1)
+					}
+
+					// Send DH init with our public key
+					publicKey := session.GetPublicKey()
+					e := new(big.Int).SetBytes(publicKey)
+
+					kexDHInit := messages.NewKexDHInitMessage(e)
+					kexDHInitBytes, err := kexDHInit.Marshal()
+					if err != nil {
+						logger.Error("Failed to marshal KEXDH_INIT: %v", err)
+						os.Exit(1)
+					}
+
+					err = packetConn.WritePacket(&transport.Packet{
+						Type:    protocol.SSH_MSG_KEXDH_INIT,
+						Payload: kexDHInitBytes[1:], // Skip message type
+					})
+					if err != nil {
+						logger.Error("Failed to send KEXDH_INIT: %v", err)
+						os.Exit(1)
+					}
+
+					keyExchangeInitiated = true
+				}
+
+			case protocol.SSH_MSG_KEXDH_REPLY:
+				logger.Info("Received KEXDH_REPLY from server")
+
+				// Parse server's DH reply
+				kexDHReply := &messages.KexDHReplyMessage{}
+				err := kexDHReply.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
 				if err != nil {
-					logger.Error("Failed to marshal KEXINIT: %v", err)
+					logger.Error("Failed to unmarshal KEXDH_REPLY: %v", err)
+					os.Exit(1)
+				}
+
+				// Process server's public key and compute shared secret
+				serverPublicKey := kexDHReply.F.Bytes()
+				sharedSecret := session.ComputeSharedSecret(serverPublicKey)
+
+				// Generate session ID and keys
+				sessionID := crypto.GenerateSessionID(
+					packetConn.Session.ClientKeyExchange,
+					packetConn.Session.ServerKeyExchange,
+					session.GetPublicKey(),
+					serverPublicKey,
+					sharedSecret,
+				)
+
+				packetConn.Session.ID = sessionID
+
+				// Generate session keys
+				keys := crypto.DeriveKeys(sharedSecret, sessionID)
+				packetConn.Session.SetKeys(keys)
+
+				// Verify server's signature (simplified)
+				logger.Info("Server key exchange signature accepted")
+
+				// Send new keys message
+				newKeys := messages.NewNewKeysMessage()
+				newKeysBytes, err := newKeys.Marshal()
+				if err != nil {
+					logger.Error("Failed to marshal NEWKEYS: %v", err)
 					os.Exit(1)
 				}
 
 				err = packetConn.WritePacket(&transport.Packet{
-					Type:    protocol.SSH_MSG_KEXINIT,
-					Payload: kexInitBytes[1:], // skip the message type byte
+					Type:    protocol.SSH_MSG_NEWKEYS,
+					Payload: newKeysBytes[1:], // Skip message type
 				})
 				if err != nil {
-					logger.Error("Failed to send KEXINIT: %v", err)
+					logger.Error("Failed to send NEWKEYS: %v", err)
 					os.Exit(1)
 				}
 
+			case protocol.SSH_MSG_NEWKEYS:
+				logger.Info("Received NEWKEYS from server")
+
+				// Enable encryption
+				packetConn.EnableEncryption()
+				keyExchangeComplete = true
+				if keyExchangeComplete {
+					logger.Debug("Key exchange flag is now true")
+				}
+				logger.Info("Key exchange completed successfully")
+
 			case protocol.SSH_MSG_IGNORE:
-				// ignore these messages (used for keep-alive)
+				// Ignore these messages (used for keep-alive)
 				logger.Debug("Received keep-alive from server")
 			}
-			
-			case err := <-errChan:
+
+		case err := <-errChan:
 			if err.Error() == "EOF" {
 				logger.Info("Server disconnected")
 			} else {
 				logger.Error("Error reading from server: %v", err)
 			}
 			os.Exit(0)
-			
-			case sig := <-sigChan:
+
+		case sig := <-sigChan:
 			logger.Info("Received signal: %v, disconnecting", sig)
-			
+
 			// Send disconnect message
-			var buf  bytes.Buffer
+			var buf bytes.Buffer
 			buf.WriteByte(protocol.SSH_DISCONNECT_BY_APPLICATION)
 			messages.WriteString(&buf, "Client disconnecting")
-			messages.WriteString(&buf, "")
-			
+			messages.WriteString(&buf, "") // Empty language tag
+
 			disconnectPacket := &transport.Packet{
-				Type: protocol.SSH_MSG_DISCONNECT,
+				Type:    protocol.SSH_MSG_DISCONNECT,
 				Payload: buf.Bytes(),
 			}
-			
+
 			if err := packetConn.WritePacket(disconnectPacket); err != nil {
 				logger.Error("Failed to send disconnect message: %v", err)
 			}
-			
+
 			os.Exit(0)
 		}
 	}

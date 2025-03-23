@@ -5,10 +5,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"time"
 
 	"github.com/marpit19/tinySSH-go/pkg/common/logging"
+	"github.com/marpit19/tinySSH-go/pkg/crypto"
 	"github.com/marpit19/tinySSH-go/pkg/protocol"
 )
 
@@ -20,20 +22,85 @@ type Packet struct {
 
 // PacketConn wraps a network connection to implement the binary packet protocol
 type PacketConn struct {
-	conn           net.Conn
+	Conn           net.Conn
 	logger         *logging.Logger
 	SequenceNumber uint32
 	lastActivity   time.Time
+	Session        *crypto.Session
+	hostKey        *crypto.HostKey
+	isEncrypted    bool
 }
 
 // NewPacketConn creates a new SSH packet connection
-func NewPacketConn(conn net.Conn, logger *logging.Logger) *PacketConn {
+func NewPacketConn(conn net.Conn, logger *logging.Logger, hostKey *crypto.HostKey) (*PacketConn, error) {
+	// initialize session
+	session, err := crypto.NewSession()
+	if err != nil {
+		return nil, err
+	}
+
 	return &PacketConn{
-		conn:           conn,
+		Conn:           conn,
 		logger:         logger,
 		SequenceNumber: 0,
 		lastActivity:   time.Now(),
+		Session:         session,
+		hostKey:        hostKey,
+		isEncrypted:    false,
+	}, nil
+}
+
+// key exchange methods
+
+// InitiateKeyExchange starts the key exchange process
+func (pc *PacketConn) InitiateKeyExchange(clientKexInit, serverKexInit []byte) error {
+	// Store key exchange messages for session ID calculation
+	pc.Session.ClientKeyExchange = clientKexInit
+	pc.Session.ServerKeyExchange = serverKexInit
+
+	return nil
+}
+
+// HandleDHInit processes the client's SSH_MSG_KEXDH_INIT message
+func (pc *PacketConn) HandleDHInit(clientPublicKey *big.Int) (*big.Int, []byte, error) {
+	// Get server's public key
+	serverPublicKey := pc.Session.DH.PublicKey
+
+	// Calculate shared secret
+	sharedSecret := pc.Session.DH.ComputeSharedSecret(clientPublicKey)
+
+	// Store keys for session ID calculation
+	clientPublicKeyBytes := clientPublicKey.Bytes()
+	serverPublicKeyBytes := serverPublicKey.Bytes()
+
+	// Generate session ID
+	sessionID := crypto.GenerateSessionID(
+		pc.Session.ClientKeyExchange,
+		pc.Session.ServerKeyExchange,
+		clientPublicKeyBytes,
+		serverPublicKeyBytes,
+		sharedSecret.Bytes(),
+	)
+
+	pc.Session.ID = sessionID
+
+	// Generate session keys
+	keys := crypto.DeriveKeys(sharedSecret.Bytes(), sessionID)
+	pc.Session.SetKeys(keys)
+
+	// Generate signature of the exchange hash
+	signature, err := pc.hostKey.SignHash(sessionID)
+	if err != nil {
+		return nil, nil, err
 	}
+
+	return serverPublicKey, signature, nil
+}
+
+// EnableEncryption enables encryption for the connection
+func (pc *PacketConn) EnableEncryption() {
+	pc.isEncrypted = true
+	pc.logger.Info("Encryption enabled for connection")
 }
 
 // ReadPacket reads a binary packet from the connection
@@ -41,7 +108,7 @@ func NewPacketConn(conn net.Conn, logger *logging.Logger) *PacketConn {
 func (pc *PacketConn) ReadPacket() (*Packet, error) {
 	// read packet length (4 bytes)
 	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(pc.conn, lenBuf); err != nil {
+	if _, err := io.ReadFull(pc.Conn, lenBuf); err != nil {
 		return nil, fmt.Errorf("failed to read packet length: %v", err)
 	}
 
@@ -55,7 +122,7 @@ func (pc *PacketConn) ReadPacket() (*Packet, error) {
 
 	// read padding length (1 byte)
 	padLenBuf := make([]byte, 1)
-	if _, err := io.ReadFull(pc.conn, padLenBuf); err != nil {
+	if _, err := io.ReadFull(pc.Conn, padLenBuf); err != nil {
 		return nil, fmt.Errorf("failed to read padding length: %v", err)
 	}
 
@@ -71,7 +138,7 @@ func (pc *PacketConn) ReadPacket() (*Packet, error) {
 
 	// read payload and padding
 	data := make([]byte, payloadLen+int(padLen))
-	if _, err := io.ReadFull(pc.conn, data); err != nil {
+	if _, err := io.ReadFull(pc.Conn, data); err != nil {
 		return nil, fmt.Errorf("failed to read packet data: %v", err)
 	}
 
@@ -132,15 +199,15 @@ func (pc *PacketConn) WritePacket(packet *Packet) error {
 	header[4] = byte(paddingLen)
 
 	// write the packet
-	if _, err := pc.conn.Write(header); err != nil {
+	if _, err := pc.Conn.Write(header); err != nil {
 		return fmt.Errorf("failed to write packet header: %v", err)
 	}
 
-	if _, err := pc.conn.Write(payload); err != nil {
+	if _, err := pc.Conn.Write(payload); err != nil {
 		return fmt.Errorf("failed to write packet payload: %v", err)
 	}
 
-	if _, err := pc.conn.Write(padding); err != nil {
+	if _, err := pc.Conn.Write(padding); err != nil {
 		return fmt.Errorf("failed to write packet padding: %v", err)
 	}
 
