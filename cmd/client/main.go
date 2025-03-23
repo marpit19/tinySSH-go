@@ -28,6 +28,7 @@ func main() {
 	host := flag.String("host", "localhost", "Host to connect to")
 	username := flag.String("user", "admin", "Username for authentication")
 	password := flag.String("pass", "password", "Password for authentication")
+	execCommand := flag.String("exec", "", "Command to execute on the server")
 	flag.Parse()
 
 	addr := fmt.Sprintf("%s:%d", *host, *port)
@@ -403,6 +404,63 @@ func main() {
 				// Update window
 				activeChannel.AdjustRemoteWindow(^uint32(len(testData) - 1))
 
+				// If a command was specified, send exec request
+				if *execCommand != "" {
+					logger.Info("Sending exec request: %s", *execCommand)
+
+					// Create exec request data
+					execData := messages.MarshalExecRequestData(*execCommand)
+
+					// Create channel request message
+					requestMsg := messages.NewChannelRequestMessage(
+						activeChannel.RemoteID(),
+						"exec",
+						true, // want reply
+						execData,
+					)
+
+					requestBytes, err := requestMsg.Marshal()
+					if err != nil {
+						logger.Error("Failed to marshal CHANNEL_REQUEST: %v", err)
+						os.Exit(1)
+					}
+
+					err = packetConn.WritePacket(&transport.Packet{
+						Type:    protocol.SSH_MSG_CHANNEL_REQUEST,
+						Payload: requestBytes[1:],
+					})
+					if err != nil {
+						logger.Error("Failed to send CHANNEL_REQUEST: %v", err)
+						os.Exit(1)
+					}
+				} else {
+					// If no command specified, send shell request
+					logger.Info("Sending shell request")
+
+					// Create channel request message
+					requestMsg := messages.NewChannelRequestMessage(
+						activeChannel.RemoteID(),
+						"shell",
+						true, // want reply
+						nil,
+					)
+
+					requestBytes, err := requestMsg.Marshal()
+					if err != nil {
+						logger.Error("Failed to marshal CHANNEL_REQUEST: %v", err)
+						os.Exit(1)
+					}
+
+					err = packetConn.WritePacket(&transport.Packet{
+						Type:    protocol.SSH_MSG_CHANNEL_REQUEST,
+						Payload: requestBytes[1:],
+					})
+					if err != nil {
+						logger.Error("Failed to send CHANNEL_REQUEST: %v", err)
+						os.Exit(1)
+					}
+				}
+
 			case protocol.SSH_MSG_CHANNEL_OPEN_FAILURE:
 				logger.Info("Received CHANNEL_OPEN_FAILURE from server")
 
@@ -526,6 +584,33 @@ func main() {
 					}
 
 					activeChannel = nil
+				}
+
+				// Add these cases to process request replies
+			case protocol.SSH_MSG_CHANNEL_SUCCESS:
+				// Parse channel success message
+				channelSuccess := &messages.ChannelSuccessMessage{}
+				err := channelSuccess.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal CHANNEL_SUCCESS: %v", err)
+					continue
+				}
+
+				logger.Info("Channel request succeeded for channel %d", channelSuccess.RecipientChannel)
+
+			case protocol.SSH_MSG_CHANNEL_FAILURE:
+				// Parse channel failure message
+				channelFailure := &messages.ChannelFailureMessage{}
+				err := channelFailure.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+				if err != nil {
+					logger.Error("Failed to unmarshal CHANNEL_FAILURE: %v", err)
+					continue
+				}
+
+				logger.Error("Channel request failed for channel %d", channelFailure.RecipientChannel)
+				if *execCommand != "" {
+					logger.Error("Failed to execute command: %s", *execCommand)
+					os.Exit(1)
 				}
 
 			case protocol.SSH_MSG_IGNORE:

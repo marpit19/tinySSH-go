@@ -828,6 +828,87 @@ func handleConnection(conn net.Conn, logger *logging.Logger) {
 				}
 			}
 
+		case protocol.SSH_MSG_CHANNEL_REQUEST:
+			if !authenticated {
+				logger.Error("Received CHANNEL_REQUEST before authentication")
+				return
+			}
+
+			// Parse channel request message
+			channelRequest := &messages.ChannelRequestMessage{}
+			err := channelRequest.Unmarshal(append([]byte{packet.Type}, packet.Payload...))
+			if err != nil {
+				logger.Error("Failed to unmarshal CHANNEL_REQUEST: %v", err)
+				return
+			}
+
+			// Get user's session
+			sessionMutex.Lock()
+			userSession, ok := sessions[remoteAddr]
+			sessionMutex.Unlock()
+
+			if !ok {
+				logger.Error("No session found for %s", remoteAddr)
+				return
+			}
+
+			// Handle channel request
+			success, err := userSession.HandleChannelRequest(
+				channelRequest.RecipientChannel,
+				channelRequest.RequestType,
+				channelRequest.WantReply,
+				channelRequest.RequestData,
+			)
+
+			if err != nil {
+				logger.Error("Failed to handle channel request: %v", err)
+			}
+
+			// Send reply if requested
+			if channelRequest.WantReply {
+				var replyPacket *transport.Packet
+
+				if success {
+					// Send channel success
+					successMsg := messages.NewChannelSuccessMessage(
+						channelRequest.RecipientChannel,
+					)
+
+					successBytes, err := successMsg.Marshal()
+					if err != nil {
+						logger.Error("Failed to marshal CHANNEL_SUCCESS: %v", err)
+						return
+					}
+
+					replyPacket = &transport.Packet{
+						Type:    protocol.SSH_MSG_CHANNEL_SUCCESS,
+						Payload: successBytes[1:],
+					}
+				} else {
+					// Send channel failure
+					failureMsg := messages.NewChannelFailureMessage(
+						channelRequest.RecipientChannel,
+					)
+
+					failureBytes, err := failureMsg.Marshal()
+					if err != nil {
+						logger.Error("Failed to marshal CHANNEL_FAILURE: %v", err)
+						return
+					}
+
+					replyPacket = &transport.Packet{
+						Type:    protocol.SSH_MSG_CHANNEL_FAILURE,
+						Payload: failureBytes[1:],
+					}
+				}
+
+				err = packetConn.WritePacket(replyPacket)
+				if err != nil {
+					logger.Error("Failed to send channel request reply: %v", err)
+					return
+				}
+			}
+
 		case protocol.SSH_MSG_IGNORE:
 			// Ignore these messages (used for keep-alive)
 			logger.Debug("Received keep-alive from client")
@@ -870,6 +951,8 @@ func handleSessionChannel(ch *channel.Channel) error {
 
 	// Set channel as open
 	ch.SetStatus(channel.ChannelStatusOpen)
+	
+	var dataBuffer bytes.Buffer
 
 	// Process data from this channel
 	for {
@@ -886,6 +969,9 @@ func handleSessionChannel(ch *channel.Channel) error {
 
 		if n > 0 {
 			logger.Debug("Read %d bytes from channel %d", n, ch.LocalID())
+			
+			// Store data in buffer
+			dataBuffer.Write(buffer[:n])
 
 			// Echo back for now (we'll replace this with proper command execution in Phase 6)
 			_, err = ch.Write(buffer[:n])

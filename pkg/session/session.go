@@ -7,6 +7,8 @@ import (
 
 	"github.com/marpit19/tinySSH-go/pkg/channel"
 	"github.com/marpit19/tinySSH-go/pkg/common/logging"
+	"github.com/marpit19/tinySSH-go/pkg/exec"
+	"github.com/marpit19/tinySSH-go/pkg/protocol/messages"
 )
 
 // ChannelHandler is a function that handles new channels
@@ -243,4 +245,73 @@ func (s *Session) Close() error {
 	s.channels = make(map[uint32]*channel.Channel)
 
 	return nil
+}
+
+// HandleChannelRequest handles a channel request
+func (s *Session) HandleChannelRequest(
+	channelID uint32,
+	requestType string,
+	wantReply bool,
+	requestData []byte,
+) (bool, error) {
+	ch, err := s.GetChannel(channelID)
+	if err != nil {
+		return false, err
+	}
+
+	s.logger.Info("Received %s request for channel %d", requestType, channelID)
+
+	// Handle different request types
+	switch requestType {
+	case "exec":
+		// Parse exec request data
+		execData, err := messages.UnmarshalExecRequestData(requestData)
+		if err != nil {
+			return false, err
+		}
+
+		s.logger.Info("Exec request: %s", execData.Command)
+
+		// Create and start command
+		cmd := exec.NewCommand(execData.Command, ch, s.logger)
+		if err := cmd.Start(); err != nil {
+			s.logger.Error("Failed to start command: %v", err)
+			return false, err
+		}
+
+		// Return success
+		return true, nil
+
+	case "shell":
+		s.logger.Info("Shell request for channel %d", channelID)
+
+		// Start interactive shell
+		go func() {
+			if err := exec.ExecuteInteractiveShell(ch, s.logger); err != nil {
+				s.logger.Error("Failed to start shell: %v", err)
+			}
+		}()
+
+		// Return success
+		return true, nil
+
+	case "subsystem":
+		// Not implemented yet
+		s.logger.Warning("Subsystem request not implemented")
+		return false, nil
+
+	case "window-change":
+		// Not implemented yet
+		s.logger.Warning("Window-change request not implemented")
+		return true, nil
+
+	case "env":
+		// Not implemented yet
+		s.logger.Warning("Environment variable request not implemented")
+		return true, nil
+
+	default:
+		s.logger.Warning("Unsupported channel request type: %s", requestType)
+		return false, nil
+	}
 }
